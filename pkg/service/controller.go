@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	ParameterThinProvisioning      = "thinProvisioning"
+	parameterThinProvisioning      = "thinProvisioning"
 	infraStorageClassNameParameter = "infraStorageClassName"
 	busParameter                   = "bus"
 	serialContextParameter         = "serial"
@@ -36,7 +36,7 @@ type ControllerService struct {
 	infraClusterNamespace string
 }
 
-var ControllerCaps = []csi.ControllerServiceCapability_RPC_Type{
+var controllerCaps = []csi.ControllerServiceCapability_RPC_Type{
 	csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
 	csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME, // attach/detach
 }
@@ -89,7 +89,7 @@ func (c *ControllerService) CreateVolume(ctx context.Context, req *csi.CreateVol
 	}
 
 	// TODO support for thin/thick provisioning from the storage class parameters
-	_, _ = strconv.ParseBool(req.Parameters[ParameterThinProvisioning])
+	_, _ = strconv.ParseBool(req.Parameters[parameterThinProvisioning])
 
 	return &csi.CreateVolumeResponse{
 		Volume: &csi.Volume{
@@ -131,7 +131,7 @@ func (c *ControllerService) ControllerPublishVolume(
 	}
 
 	// Get VM name
-	vmName, err := c.getVmNameByCSINodeID(ctx, c.infraClusterNamespace, req.NodeId)
+	vmName, err := c.getVMNameByCSINodeID(ctx, c.infraClusterNamespace, req.NodeId)
 	if err != nil {
 		return nil, err
 	}
@@ -187,7 +187,7 @@ func (c *ControllerService) ControllerUnpublishVolume(_ context.Context, req *cs
 	}
 
 	// Get VM name
-	vmName, err := c.getVmNameByCSINodeID(context.Background(), c.infraClusterNamespace, req.NodeId)
+	vmName, err := c.getVMNameByCSINodeID(context.Background(), c.infraClusterNamespace, req.NodeId)
 	if err != nil {
 		return nil, err
 	}
@@ -214,45 +214,45 @@ func (c *ControllerService) ControllerUnpublishVolume(_ context.Context, req *cs
 	return &csi.ControllerUnpublishVolumeResponse{}, nil
 }
 
-//ValidateVolumeCapabilities
+//ValidateVolumeCapabilities unimplemented
 func (c *ControllerService) ValidateVolumeCapabilities(context.Context, *csi.ValidateVolumeCapabilitiesRequest) (*csi.ValidateVolumeCapabilitiesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "")
 }
 
-//ListVolumes
+//ListVolumes unimplemented
 func (c *ControllerService) ListVolumes(context.Context, *csi.ListVolumesRequest) (*csi.ListVolumesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "")
 }
 
-//GetCapacity
+//GetCapacity unimplemented
 func (c *ControllerService) GetCapacity(context.Context, *csi.GetCapacityRequest) (*csi.GetCapacityResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "")
 }
 
-//CreateSnapshot
+//CreateSnapshot unimplemented
 func (c *ControllerService) CreateSnapshot(context.Context, *csi.CreateSnapshotRequest) (*csi.CreateSnapshotResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "")
 }
 
-//DeleteSnapshot
+//DeleteSnapshot unimplemented
 func (c *ControllerService) DeleteSnapshot(context.Context, *csi.DeleteSnapshotRequest) (*csi.DeleteSnapshotResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "")
 }
 
-//ListSnapshots
+//ListSnapshots unimplemented
 func (c *ControllerService) ListSnapshots(context.Context, *csi.ListSnapshotsRequest) (*csi.ListSnapshotsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "")
 }
 
-//ControllerExpandVolume
+//ControllerExpandVolume unimplemented
 func (c *ControllerService) ControllerExpandVolume(context.Context, *csi.ControllerExpandVolumeRequest) (*csi.ControllerExpandVolumeResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "")
 }
 
-//ControllerGetCapabilities
+//ControllerGetCapabilities returns the supported controller capabilities
 func (c *ControllerService) ControllerGetCapabilities(context.Context, *csi.ControllerGetCapabilitiesRequest) (*csi.ControllerGetCapabilitiesResponse, error) {
-	caps := make([]*csi.ControllerServiceCapability, 0, len(ControllerCaps))
-	for _, capability := range ControllerCaps {
+	caps := make([]*csi.ControllerServiceCapability, 0, len(controllerCaps))
+	for _, capability := range controllerCaps {
 		caps = append(
 			caps,
 			&csi.ControllerServiceCapability{
@@ -266,15 +266,9 @@ func (c *ControllerService) ControllerGetCapabilities(context.Context, *csi.Cont
 	}
 	return &csi.ControllerGetCapabilitiesResponse{Capabilities: caps}, nil
 }
-
+// ControllerGetVolume unimplemented
 func (c *ControllerService) ControllerGetVolume(ctx context.Context, request *csi.ControllerGetVolumeRequest) (*csi.ControllerGetVolumeResponse, error) {
-
-	return &csi.ControllerGetVolumeResponse{
-		Volume: &csi.Volume{
-			CapacityBytes: 0,
-			VolumeId:      "TODO",
-		},
-	}, nil
+	return nil, status.Error(codes.Unimplemented, "")
 }
 
 func (c *ControllerService) getDataVolumeNameByUID(ctx context.Context, uid string) (string, error) {
@@ -291,9 +285,9 @@ func (c *ControllerService) getDataVolumeNameByUID(ctx context.Context, uid stri
 	return "", fmt.Errorf("failed to match DataVolume by uid %s", uid)
 }
 
-// getVmNameByCSINodeID find a VM in infra cluster by its firmware uuid. The uid is the ID that the CSI node
+// getVMNameByCSINodeID find a VM in infra cluster by its firmware uuid. The uid is the ID that the CSI node
 // part publishes in NodeGetInfo and then used by CSINode.spec.drivers[].nodeID
-func (c *ControllerService) getVmNameByCSINodeID(_ context.Context, namespace string, csiNodeID string) (string, error) {
+func (c *ControllerService) getVMNameByCSINodeID(_ context.Context, namespace string, csiNodeID string) (string, error) {
 	vmis, err := c.kubevirtClient.ListVirtualMachines(namespace)
 	if err != nil {
 		klog.Errorf("failed to list VMIS %v", err)

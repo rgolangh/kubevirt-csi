@@ -64,7 +64,7 @@ func (c *client) CreateDataVolume(namespace string, dataVolume csiv1alpha1.DataV
 	return err
 }
 
-// New creates our client wrapper object for the actual kubeVirt and kubernetes clients we use.
+// NewClient New creates our client wrapper object for the actual kubeVirt and kubernetes clients we use.
 func NewClient(config *rest.Config) (Client, error) {
 	result := &client{}
 
