@@ -34,11 +34,7 @@ func NewKubevirtCSIDriver(infraClusterClient kubernetes.Clientset, virtClient ku
 			infraClusterClient:    infraClusterClient,
 			kubevirtClient:        virtClient,
 		},
-		NodeService: &NodeService{
-			infraClusterClient: kubernetes.Clientset{},
-			kubevirtClient:     virtClient,
-			nodeID:             nodeID,
-		},
+		NodeService: NewNodeService(kubernetes.Clientset{}, virtClient, nodeID),
 	}
 	return &d
 }
