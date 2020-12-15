@@ -58,8 +58,14 @@ vendor:
 mockgen:
 	mockgen -source=pkg/kubevirt/client.go -destination=pkg/kubevirt/mocked_client.go -package=kubevirt
 
-test-functional:
-	ginkgo
+.PHONY: build-functional
+build-functional:
+	./hack/build-tests.sh
+
+.PHONY: test-functional
+test-functional: build-functional
+	./hack/run-tests.sh
+
 
 SHELL :=/bin/bash
 
