@@ -19,7 +19,9 @@ type ClientBuilderFuncType func(kubeconfig string) (Client, error)
 // Client is a wrapper object for actual infra-cluster clients: kubernetes and the kubevirt
 type Client interface {
 	Ping(ctx context.Context) error
+	GetVirtualMachine(namespace string, name string) (*kubevirtapiv1.VirtualMachineInstance, error)
 	ListVirtualMachines(namespace string) ([]kubevirtapiv1.VirtualMachineInstance, error)
+	GetDataVolume(namespace string, name string) (*cdiv1alpha1.DataVolume, error)
 	DeleteDataVolume(namespace string, name string) error
 	CreateDataVolume(namespace string, dataVolume *cdiv1alpha1.DataVolume) (*cdiv1alpha1.DataVolume, error)
 	AddVolumeToVM(namespace string, vmName string, hotPlugRequest *kubevirtapiv1.AddVolumeOptions) error
@@ -59,6 +61,11 @@ func (c *client) RemoveVolumeFromVM(namespace string, vmName string, hotPlugRequ
 	return c.virtClient.VirtualMachine(namespace).RemoveVolume(vmName, hotPlugRequest)
 }
 
+//GetVirtualMachines fetches a specified VMI
+func (c *client) GetVirtualMachine(namespace string, name string) (*kubevirtapiv1.VirtualMachineInstance, error) {
+	return c.virtClient.VirtualMachineInstance(namespace).Get(name, &metav1.GetOptions{})
+}
+
 //ListVirtualMachines fetches a list of VMIs from a namespace
 func (c *client) ListVirtualMachines(namespace string) ([]kubevirtapiv1.VirtualMachineInstance, error) {
 	list, err := c.virtClient.VirtualMachineInstance(namespace).List(&metav1.ListOptions{})
@@ -67,6 +74,12 @@ func (c *client) ListVirtualMachines(namespace string) ([]kubevirtapiv1.VirtualM
 	}
 	return list.Items, nil
 }
+
+//GetDataVolume returns a the specified DataVolume
+func (c *client) GetDataVolume(namespace string, name string) (*cdiv1alpha1.DataVolume, error) {
+	return c.virtClient.CdiClient().CdiV1alpha1().DataVolumes(namespace).Get(name, metav1.GetOptions{})
+}
+
 
 //CreateDataVolume creates a new DataVolume under a namespace
 func (c *client) CreateDataVolume(namespace string, dataVolume *cdiv1alpha1.DataVolume) (*cdiv1alpha1.DataVolume, error) {

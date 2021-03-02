@@ -1,0 +1,104 @@
+kind: Pod
+apiVersion: v1
+metadata:
+  name: sanity-test
+  namespace: kubevirt-csi-driver
+  labels:
+    app: sanity-test
+spec:
+  hostNetwork: true
+  serviceAccount: kubevirt-csi-controller-sa
+  priorityClassName: system-cluster-critical
+  restartPolicy: OnFailure
+  nodeSelector:
+    node-role.kubernetes.io/master: ""
+  tolerations:
+    - key: CriticalAddonsOnly
+      operator: Exists
+    - key: node-role.kubernetes.io/master
+      operator: Exists
+      effect: "NoSchedule"
+  containers:
+    - name: csi-driver
+      securityContext:
+        privileged: true
+        allowPrivilegeEscalation: true
+      imagePullPolicy: Always
+      image: quay.io/isaacdorfman/kubevirt-csi-driver:latest
+      args:
+        - "--endpoint=$(CSI_ENDPOINT)"
+        - "--namespace=kubevirt-csi-driver"
+        - "--node-name=$(KUBE_NODE_NAME)"
+        - "--infra-cluster-namespace=$(INFRACLUSTER_NAMESPACE)"
+        - "--infra-cluster-kubeconfig=/var/run/secrets/infracluster/kubeconfig"
+        - --v=5
+      ports:
+        - name: healthz
+          # Due to hostNetwork, this port is open on a node!
+          containerPort: 10301
+          protocol: TCP
+      env:
+        - name: CSI_ENDPOINT
+          value: unix:///var/lib/csi/sockets/pluginproxy/csi.sock
+        - name: KUBE_NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: INFRACLUSTER_NAMESPACE
+          valueFrom:
+            configMapKeyRef:
+              name: driver-config
+              key: infraClusterNamespace
+      volumeMounts:
+        - name: infracluster
+          mountPath: "/var/run/secrets/infracluster"
+        - name: kubelet-dir
+          mountPath: /var/lib/kubelet
+          mountPropagation: "Bidirectional"
+        - name: plugin-dir
+          mountPath: /csi
+        - name: device-dir
+          mountPath: /dev
+        - name: udev
+          mountPath: /run/udev
+        - name: socket-dir
+          mountPath: /var/lib/csi/sockets/pluginproxy/
+      resources:
+        requests:
+          memory: 50Mi
+          cpu: 10m
+    - name: csi-sanity-test
+      image: quay.io/isaacdorfman/kubernetes-csi-sanity-test
+      args:
+        - "--csi.endpoint=$(CSI_ENDPOINT)"
+      env:
+        - name: CSI_ENDPOINT
+          value: unix:///var/lib/csi/sockets/pluginproxy/csi.sock
+      volumeMounts:
+        - name: socket-dir
+          mountPath: /var/lib/csi/sockets/pluginproxy/
+  volumes:
+    - name: infracluster
+      secret:
+        secretName: infra-cluster-credentials
+    - name: kubelet-dir
+      hostPath:
+        path: /var/lib/kubelet
+        type: Directory
+    - name: plugin-dir
+      hostPath:
+        path: /var/lib/kubelet/plugins/csi.kubevirt.io/
+        type: DirectoryOrCreate
+    - name: registration-dir
+      hostPath:
+        path: /var/lib/kubelet/plugins_registry/
+        type: Directory
+    - name: device-dir
+      hostPath:
+        path: /dev
+        type: Directory
+    - name: udev
+      hostPath:
+        path: /run/udev
+    - name: socket-dir
+      emptyDir: {}

@@ -25,9 +25,9 @@ test:
 	go test -v ./pkg/... ./cmd/... -coverprofile cover.out
 	hack/run-lint-checks.sh
 
-#.PHONY: build
-#build:
-#	go build -o $(BINDIR)/kubevirt-csi-driver -ldflags '-X version.Version=$(REV)' cmd/kubevirt-csi-driver/kubevirt-csi-driver.go
+.PHONY: build
+build:
+	go build -o $(BINDIR)/kubevirt-csi-driver -ldflags '-X version.Version=$(REV)' -gcflags 'all=-N -l' cmd/kubevirt-csi-driver/kubevirt-csi-driver.go
 
 .PHONY: verify
 verify: fmt vet
@@ -60,11 +60,19 @@ mockgen:
 
 .PHONY: build-functional
 build-functional:
-	./hack/build-tests.sh
+	./hack/build-functional-tests.sh
 
 .PHONY: test-functional
 test-functional: build-functional
-	./hack/run-tests.sh
+	./hack/run-functional-tests.sh
+
+.PHONY: build-sanity
+build-sanity:
+	./hack/build-sanity-tests.sh
+
+.PHONY: test-sanity
+test-sanity: build-sanity
+	./hack/run-sanity-tests.sh
 
 
 SHELL :=/bin/bash

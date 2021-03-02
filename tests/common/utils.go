@@ -1,9 +1,10 @@
-package functional_test
+package common_test
 
 import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -11,14 +12,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
-	"github.com/kubevirt/csi-driver/pkg/generated"
-	"github.com/onsi/ginkgo"
-	ocproutev1 "github.com/openshift/api/route/v1"
-	routesclientset "github.com/openshift/client-go/route/clientset/versioned/typed/route/v1"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -29,28 +25,49 @@ import (
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/restmapper"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/clientcmd/api"
 	"k8s.io/kubernetes/pkg/apis/storage"
 	"kubevirt.io/client-go/kubecli"
 
+	"github.com/google/uuid"
+	"github.com/kubevirt/csi-driver/pkg/generated"
+	"github.com/onsi/ginkgo"
+
+	ocproutev1 "github.com/openshift/api/route/v1"
+	routesclientset "github.com/openshift/client-go/route/clientset/versioned/typed/route/v1"
 	corev1 "k8s.io/api/core/v1"
 	apiresource "k8s.io/apimachinery/pkg/api/resource"
-	"k8s.io/client-go/tools/clientcmd"
+	k8smetav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	kubevirtv1 "kubevirt.io/client-go/api/v1"
 	cdiv1 "kubevirt.io/containerized-data-importer/pkg/apis/core/v1alpha1"
 	testscore "kubevirt.io/kubevirt/tests"
 
-	k8smetav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	kubevirtv1 "kubevirt.io/client-go/api/v1"
-
+	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
+
+	apiwatch "k8s.io/apimachinery/pkg/watch"
+	clientwatch "k8s.io/client-go/tools/watch"
 )
 
 const (
-	testStorageClass = "standard"
-	k8sMachineName   = "k8s-machine"
-	routeName        = "k8s-api"
-	tenantConfigName = "tenant-config"
+	TestStorageClass = "standard"
+	K8sMachineName   = "k8s-machine"
+	RouteName        = "k8s-api"
+	TenantConfigName = "tenant-config"
 )
+
+var running = true
+
+type InfraCluster struct {
+	// kubevirt's client for creating needed resources to install the cluster on
+	VirtCli    kubecli.KubevirtClient
+	Kubeconfig clientcmd.ClientConfig
+	// the infra Namespace for creating resources
+	Namespace string
+}
 
 var testNamespace = "kubevirt-csi-driver-func-test-" + uuid.New().String()[0:7]
 var teardownNamespace = true
@@ -61,19 +78,12 @@ func init() {
 	}
 
 }
-type InfraCluster struct {
-	// kubevirt's client for creating needed resources to install the cluster on
-	virtCli    kubecli.KubevirtClient
-	kubeconfig clientcmd.ClientConfig
-	// the infra namespace for creating resources
-	namespace string
-}
 
 type TenantCluster struct {
-	namespace  string
-	config     *api.Config
-	client     *kubernetes.Clientset
-	restConfig *rest.Config
+	Namespace  string
+	Config     *api.Config
+	Client     *kubernetes.Clientset
+	RestConfig *rest.Config
 }
 
 func PrepareEnv(clusterSetup InfraCluster) {
@@ -82,8 +92,8 @@ func PrepareEnv(clusterSetup InfraCluster) {
 
 func TearDownEnv(infraCluster InfraCluster) {
 	if teardownNamespace {
-		err := infraCluster.virtCli.CoreV1().
-			Namespaces().Delete(context.Background(), infraCluster.namespace, metav1.DeleteOptions{})
+		err := infraCluster.VirtCli.CoreV1().
+			Namespaces().Delete(context.Background(), infraCluster.Namespace, metav1.DeleteOptions{})
 		Expect(err).ToNot(HaveOccurred(), "Failed deleting the namespace post suite. Please clean manually")
 	}
 }
@@ -98,13 +108,13 @@ func (c *InfraCluster) setupTenantCluster() {
 }
 
 func (c *InfraCluster) exposeTenantAPI() error {
-	_, err := c.virtCli.CoreV1().Services(c.namespace).Create(context.Background(), &v1.Service{
+	_, err := c.VirtCli.CoreV1().Services(c.Namespace).Create(context.Background(), &v1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "api",
 		},
 		Spec: v1.ServiceSpec{
 			Ports:           []v1.ServicePort{{Port: 6443, TargetPort: intstr.IntOrString{IntVal: 6443}, Protocol: v1.ProtocolTCP}},
-			Selector:        map[string]string{"kubevirt.io/domain": k8sMachineName},
+			Selector:        map[string]string{"kubevirt.io/domain": K8sMachineName},
 			Type:            "NodePort",
 			SessionAffinity: "None",
 		},
@@ -121,7 +131,7 @@ func (c *InfraCluster) createServiceAccount() error {
 	if err != nil {
 		return nil
 	}
-	_, err = c.virtCli.CoreV1().ServiceAccounts(c.namespace).Create(context.Background(), &sa, metav1.CreateOptions{})
+	_, err = c.VirtCli.CoreV1().ServiceAccounts(c.Namespace).Create(context.Background(), &sa, metav1.CreateOptions{})
 	if !errors.IsAlreadyExists(err) {
 		return err
 	}
@@ -136,7 +146,7 @@ func (c *InfraCluster) createAPIRoute() (*ocproutev1.Route, error) {
 			APIVersion: ocproutev1.GroupVersion.String(),
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name: routeName,
+			Name: RouteName,
 		},
 		Spec: ocproutev1.RouteSpec{
 			TLS: &ocproutev1.TLSConfig{
@@ -148,12 +158,12 @@ func (c *InfraCluster) createAPIRoute() (*ocproutev1.Route, error) {
 		},
 	}
 
-	routes, err := routesclientset.NewForConfig(c.virtCli.Config())
+	routes, err := routesclientset.NewForConfig(c.VirtCli.Config())
 	if err != nil {
 		return nil, err
 	}
 
-	route, err := routes.Routes(c.namespace).Create(context.Background(), &r, metav1.CreateOptions{})
+	route, err := routes.Routes(c.Namespace).Create(context.Background(), &r, metav1.CreateOptions{})
 	if !errors.IsAlreadyExists(err) {
 		return nil, err
 	}
@@ -162,9 +172,9 @@ func (c *InfraCluster) createAPIRoute() (*ocproutev1.Route, error) {
 
 func (c *InfraCluster) createNamespace() {
 	fmt.Fprint(ginkgo.GinkgoWriter, "Creating the test namespace...\n")
-	_, err := c.virtCli.CoreV1().Namespaces().Create(context.Background(), &v1.Namespace{
+	_, err := c.VirtCli.CoreV1().Namespaces().Create(context.Background(), &v1.Namespace{
 		ObjectMeta: k8smetav1.ObjectMeta{
-			Name: c.namespace,
+			Name: c.Namespace,
 		},
 	}, metav1.CreateOptions{})
 	if !errors.IsAlreadyExists(err) {
@@ -173,36 +183,36 @@ func (c *InfraCluster) createNamespace() {
 }
 
 func (c *InfraCluster) createVm() {
-	routes, err := routesclientset.NewForConfig(c.virtCli.Config())
+	routes, err := routesclientset.NewForConfig(c.VirtCli.Config())
 	Expect(err).NotTo(HaveOccurred())
-	route, err := routes.Routes(c.namespace).Get(context.Background(), routeName, metav1.GetOptions{})
+	route, err := routes.Routes(c.Namespace).Get(context.Background(), RouteName, metav1.GetOptions{})
 	Expect(err).NotTo(HaveOccurred())
 
 	fmt.Fprint(ginkgo.GinkgoWriter, "Creating a VM for k8s deployment...\n")
 
-	k8sMachine, rootDv, secret := newK8sMachine(c.kubeconfig, *route, c.namespace)
+	k8sMachine, rootDv, secret := newK8sMachine(c.Kubeconfig, *route, c.Namespace)
 
-	_, err = c.virtCli.CdiClient().CdiV1alpha1().DataVolumes(c.namespace).Create(context.Background(), rootDv, metav1.CreateOptions{})
+	_, err = c.VirtCli.CdiClient().CdiV1alpha1().DataVolumes(c.Namespace).Create(context.Background(), rootDv, metav1.CreateOptions{})
 	if !errors.IsAlreadyExists(err) {
 		Expect(err).NotTo(HaveOccurred())
 	}
 
-	_, err = c.virtCli.CoreV1().Secrets(c.namespace).Create(context.Background(), secret, metav1.CreateOptions{})
+	_, err = c.VirtCli.CoreV1().Secrets(c.Namespace).Create(context.Background(), secret, metav1.CreateOptions{})
 	if !errors.IsAlreadyExists(err) {
 		Expect(err).NotTo(HaveOccurred())
 	}
-	_, err = c.virtCli.VirtualMachine(c.namespace).Create(k8sMachine)
+	_, err = c.VirtCli.VirtualMachine(c.Namespace).Create(k8sMachine)
 	if !errors.IsAlreadyExists(err) {
 		Expect(err).NotTo(HaveOccurred())
 	}
 	Eventually(func() bool {
-		vmi, _ := c.virtCli.VirtualMachineInstance(c.namespace).Get(k8sMachineName, &metav1.GetOptions{})
+		vmi, _ := c.VirtCli.VirtualMachineInstance(c.Namespace).Get(K8sMachineName, &metav1.GetOptions{})
 		return vmi.Status.Phase == kubevirtv1.Running
 	}, 40*time.Minute, 30*time.Second).Should(BeTrue(), "failed to get the vmi Running")
 
 }
 
-func (c *InfraCluster) createObject(restConfig rest.Config, discovery discovery.DiscoveryInterface, namespace string, reader *bytes.Reader) (runtime.Object, error) {
+func (c *InfraCluster) CreateObject(restConfig rest.Config, discovery discovery.DiscoveryInterface, namespace string, reader *bytes.Reader) (runtime.Object, error) {
 	objs, err := objectsFromYAML(reader)
 	if err != nil {
 		return nil, err
@@ -232,63 +242,29 @@ func (c *InfraCluster) createObject(restConfig rest.Config, discovery discovery.
 	return createdObjs[0], nil
 }
 
-func objectsFromYAML(reader *bytes.Reader) ([]runtime.Object, error) {
-	// register CSI v1. CSI v1 is missing because client-go is pinned to 0.16 because of kubevirt client deps.
-	newScheme := runtime.NewScheme()
-	newScheme.AddKnownTypes(
-		schema.GroupVersion{Group: storage.GroupName, Version: "v1"},
-		&storage.CSINode{},
-		&storage.CSINodeList{},
-		&storage.CSIDriver{},
-		&storage.CSIDriverList{},
-	)
-	//factory := serializer.NewCodecFactory(newScheme)
-	//csiDecode := factory.UniversalDecoder(schema.GroupVersion{Group: storage.GroupName, Version: "v1"}).Decode
-	decode := scheme.Codecs.UniversalDeserializer().Decode
-	all, _ := ioutil.ReadAll(reader)
-	d := yaml.NewYAMLOrJSONDecoder(bytes.NewReader(all), 4096)
-	// data from reader may contain multi objects, stream and get a list
-	var o []runtime.Object
-	for {
-		ext := runtime.RawExtension{}
-		if err := d.Decode(&ext); err != nil {
-			if err == io.EOF {
-				break
-			}
-		}
-		ext.Raw = bytes.TrimSpace(ext.Raw)
-		if len(ext.Raw) == 0 || bytes.Equal(ext.Raw, []byte("null")) {
-			continue
-		}
-		obj, _, err := decode(ext.Raw, nil, nil)
-		if err != nil {
-			return nil, err
-		}
-		o = append(o, obj)
+func GetInfraCluster() InfraCluster {
+	client, err := kubecli.GetKubevirtClient()
+	Expect(err).NotTo(HaveOccurred(), "Failed getting KubeVirt client")
+
+	kubeconfig := flag.Lookup("kubeconfig").Value
+	Expect(kubeconfig.String()).NotTo(BeEmpty())
+	config := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+		&clientcmd.ClientConfigLoadingRules{ExplicitPath: kubeconfig.String()},
+		&clientcmd.ConfigOverrides{})
+
+	infraCluster := InfraCluster{
+		client,
+		config,
+		testNamespace,
 	}
-	return o, nil
+	return infraCluster
 }
-
-func newRestClient(restConfig rest.Config, gv schema.GroupVersion) (rest.Interface, error) {
-	restConfig.ContentConfig = resource.UnstructuredPlusDefaultContentConfig()
-	restConfig.GroupVersion = &gv
-	if len(gv.Group) == 0 {
-		restConfig.APIPath = "/api"
-	} else {
-		restConfig.APIPath = "/apis"
-	}
-
-	return rest.RESTClientFor(&restConfig)
-}
-
-var readOnlyMode int32 = 0600
-var running = true
 
 func newK8sMachine(config clientcmd.ClientConfig, route ocproutev1.Route, namespace string) (*kubevirtv1.VirtualMachine, *cdiv1.DataVolume, *corev1.Secret) {
 	vmiTemplateSpec := &kubevirtv1.VirtualMachineInstanceTemplateSpec{}
 	vm := kubevirtv1.VirtualMachine{
 		ObjectMeta: k8smetav1.ObjectMeta{
-			Name: k8sMachineName,
+			Name: K8sMachineName,
 		},
 		Spec: kubevirtv1.VirtualMachineSpec{
 			Running:  &running,
@@ -298,7 +274,7 @@ func newK8sMachine(config clientcmd.ClientConfig, route ocproutev1.Route, namesp
 
 	mem := apiresource.MustParse("16G")
 	vmiTemplateSpec.ObjectMeta.Labels = map[string]string{
-		"kubevirt.io/domain": k8sMachineName,
+		"kubevirt.io/domain": K8sMachineName,
 	}
 	vmiTemplateSpec.Spec.Domain = kubevirtv1.DomainSpec{
 		CPU: &kubevirtv1.CPU{
@@ -317,7 +293,7 @@ func newK8sMachine(config clientcmd.ClientConfig, route ocproutev1.Route, namesp
 		"root-disk-dv",
 		"https://cloud.centos.org/centos/7/images/CentOS-7-x86_64-GenericCloud-2009.qcow2c",
 		"15G",
-		testStorageClass)
+		TestStorageClass)
 
 	cloudInitDisk := "cloudinit-disk"
 	rootDisk := "root-disk"
@@ -374,6 +350,56 @@ func newK8sMachine(config clientcmd.ClientConfig, route ocproutev1.Route, namesp
 	return &vm, dataVolume, &secret
 }
 
+
+func objectsFromYAML(reader *bytes.Reader) ([]runtime.Object, error) {
+	// register CSI v1. CSI v1 is missing because client-go is pinned to 0.16 because of kubevirt client deps.
+	newScheme := runtime.NewScheme()
+	newScheme.AddKnownTypes(
+		schema.GroupVersion{Group: storage.GroupName, Version: "v1"},
+		&storage.CSINode{},
+		&storage.CSINodeList{},
+		&storage.CSIDriver{},
+		&storage.CSIDriverList{},
+	)
+	//factory := serializer.NewCodecFactory(newScheme)
+	//csiDecode := factory.UniversalDecoder(schema.GroupVersion{Group: storage.GroupName, Version: "v1"}).Decode
+	decode := scheme.Codecs.UniversalDeserializer().Decode
+	all, _ := ioutil.ReadAll(reader)
+	d := yaml.NewYAMLOrJSONDecoder(bytes.NewReader(all), 4096)
+	// data from reader may contain multi objects, stream and get a list
+	var o []runtime.Object
+	for {
+		ext := runtime.RawExtension{}
+		if err := d.Decode(&ext); err != nil {
+			if err == io.EOF {
+				break
+			}
+		}
+		ext.Raw = bytes.TrimSpace(ext.Raw)
+		if len(ext.Raw) == 0 || bytes.Equal(ext.Raw, []byte("null")) {
+			continue
+		}
+		obj, _, err := decode(ext.Raw, nil, nil)
+		if err != nil {
+			return nil, err
+		}
+		o = append(o, obj)
+	}
+	return o, nil
+}
+
+func newRestClient(restConfig rest.Config, gv schema.GroupVersion) (rest.Interface, error) {
+	restConfig.ContentConfig = resource.UnstructuredPlusDefaultContentConfig()
+	restConfig.GroupVersion = &gv
+	if len(gv.Group) == 0 {
+		restConfig.APIPath = "/api"
+	} else {
+		restConfig.APIPath = "/apis"
+	}
+
+	return rest.RESTClientFor(&restConfig)
+}
+
 func newDataVolume(name, imageUrl, diskSize, storageClass string) *cdiv1.DataVolume {
 	quantity, err := apiresource.ParseQuantity(diskSize)
 	testscore.PanicOnError(err)
@@ -405,6 +431,113 @@ func newDataVolume(name, imageUrl, diskSize, storageClass string) *cdiv1.DataVol
 	}
 
 	return dataVolume
+}
+
+func GetTenantCluster(c InfraCluster) TenantCluster {
+	waitForTenant(c)
+	// get the tenant kubeconfig
+	tenantConfigMap, err := c.VirtCli.CoreV1().
+		ConfigMaps(c.Namespace).Get(context.Background(), TenantConfigName, metav1.GetOptions{})
+	Expect(err).NotTo(HaveOccurred())
+
+	routes, err := routesclientset.NewForConfig(c.VirtCli.Config())
+	Expect(err).NotTo(HaveOccurred())
+	route, err := routes.Routes(c.Namespace).Get(context.Background(), RouteName, metav1.GetOptions{})
+	Expect(err).NotTo(HaveOccurred())
+
+	tenantCluster, err := getTenantClusterSetup(tenantConfigMap, route)
+	Expect(err).NotTo(HaveOccurred())
+	return *tenantCluster
+}
+
+func waitForTenant(c InfraCluster) {
+	fmt.Fprintf(GinkgoWriter, "Wait for tenant to be up... ")
+	// wait till the config map is set by the tenant. This means the install is successful
+	// and we can extract the kubeconfig
+	tenantUpTimeout, cancelFunc := context.WithTimeout(context.Background(), time.Minute*40)
+	defer cancelFunc()
+	_, _ = clientwatch.UntilWithSync(
+		tenantUpTimeout,
+		cache.NewListWatchFromClient(c.VirtCli.CoreV1().RESTClient(), "configmaps",
+			c.Namespace, fields.OneTermEqualSelector("metadata.name", TenantConfigName)),
+		&v1.ConfigMap{},
+		nil,
+		func(event apiwatch.Event) (bool, error) {
+			switch event.Type {
+			case apiwatch.Added:
+			default:
+				return false, nil
+			}
+			_, ok := event.Object.(*v1.ConfigMap)
+			if !ok {
+				Fail("couldn't find config map 'tenant-config' in the namespace. Tenant cluster might failed installation")
+			}
+
+			fmt.Fprintf(GinkgoWriter, "up and running\n")
+			return true, nil
+		},
+	)
+}
+
+func getTenantClusterSetup(cm *v1.ConfigMap, route *ocproutev1.Route) (*TenantCluster, error) {
+	// substitute the internal API IP with the ingress route
+	tenantConfigData := cm.Data["admin.conf"]
+	tenantConfig, err := clientcmd.Load([]byte(tenantConfigData))
+	tenantConfig.Clusters["kubernetes"].Server = fmt.Sprintf("https://%s", route.Spec.Host)
+	if err != nil {
+		return nil, err
+	}
+	clientcmd.WriteToFile(*tenantConfig, "/home/isaakdorfman/.kube/tmp")
+	if err != nil {
+		return nil, err
+	}
+	config, err := clientcmd.NewDefaultClientConfig(*tenantConfig, &clientcmd.ConfigOverrides{}).ClientConfig()
+	if err != nil {
+		return nil, err
+	}
+	tenantClient, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return nil, err
+	}
+
+	version, err := tenantClient.ServerVersion()
+	fmt.Fprintf(GinkgoWriter, "Tenant server version %v\n", version)
+	Expect(err).NotTo(HaveOccurred())
+
+	return &TenantCluster{
+		Namespace:  "kubevirt-csi-driver",
+		Config:     tenantConfig,
+		RestConfig: config,
+		Client:     tenantClient,
+	}, nil
+}
+
+func DeploySecretWithInfraDetails(c InfraCluster, tenantSetup TenantCluster) {
+	s := v1.Secret{}
+	secretData := bytes.NewReader(generated.MustAsset("deploy/secret.yaml"))
+	err := yaml.NewYAMLToJSONDecoder(secretData).Decode(&s)
+	Expect(err).NotTo(HaveOccurred())
+
+	s.Data = make(map[string][]byte)
+	infraKubeconfig, err := c.Kubeconfig.RawConfig()
+	Expect(err).NotTo(HaveOccurred())
+	kubeconfigData, err := clientcmd.Write(infraKubeconfig)
+	Expect(err).NotTo(HaveOccurred())
+	s.Data["kubeconfig"] = kubeconfigData
+	_, err = tenantSetup.Client.CoreV1().Secrets(tenantSetup.Namespace).Create(context.Background(), &s, metav1.CreateOptions{})
+	if !errors.IsAlreadyExists(err) {
+		Expect(err).NotTo(HaveOccurred())
+	}
+
+	cm := v1.ConfigMap{}
+	cmData := bytes.NewReader(generated.MustAsset("deploy/configmap.yaml"))
+	err = yaml.NewYAMLToJSONDecoder(cmData).Decode(&cm)
+	Expect(err).NotTo(HaveOccurred())
+	cm.Data["infraClusterNamespace"] = c.Namespace
+	_, err = tenantSetup.Client.CoreV1().ConfigMaps(tenantSetup.Namespace).Create(context.Background(), &cm, metav1.CreateOptions{})
+	if !errors.IsAlreadyExists(err) {
+		Expect(err).NotTo(HaveOccurred())
+	}
 }
 
 var cloudinitdata = `#cloud-config

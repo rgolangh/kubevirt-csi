@@ -13,6 +13,8 @@ import (
 	"k8s.io/utils/mount"
 
 	"github.com/kubevirt/csi-driver/pkg/kubevirt"
+
+	. "github.com/kubevirt/csi-driver/tests/common"
 )
 
 const serialID = "4b13cebc-7406-4c19-8832-7fcb1d4ac8c5"

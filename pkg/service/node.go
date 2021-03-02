@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"strings"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"k8s.io/utils/mount"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -72,6 +74,17 @@ type dirMakerFunc func(path string, perm os.FileMode) error
 func (n *NodeService) NodeStageVolume(_ context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
 	klog.Infof("Staging volume %s", req.VolumeId)
 
+	// Check arguments
+	if len(req.GetVolumeId()) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "Volume ID missing in request")
+	}
+	if len(req.GetStagingTargetPath()) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "Target path missing in request")
+	}
+	if req.GetVolumeCapability() == nil {
+		return nil, status.Error(codes.InvalidArgument, "Volume Capability missing in request")
+	}
+
 	if req.VolumeCapability.GetBlock() != nil {
 		err := fmt.Errorf("block mode is not supported")
 		klog.Error(err)
@@ -107,12 +120,29 @@ func (n *NodeService) NodeStageVolume(_ context.Context, req *csi.NodeStageVolum
 
 // NodeUnstageVolume unstages a volume from the node
 func (n *NodeService) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolumeRequest) (*csi.NodeUnstageVolumeResponse, error) {
+	// Check arguments
+	if len(req.GetVolumeId()) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "Volume ID missing in request")
+	}
+	if len(req.GetStagingTargetPath()) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "Target path missing in request")
+	}
+
 	// nothing to do here, we don't erase the filesystem of a device.
 	return &csi.NodeUnstageVolumeResponse{}, nil
 }
 
 //NodePublishVolume mounts the volume to the target path (req.GetTargetPath)
 func (n *NodeService) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
+	if req.GetVolumeCapability() == nil {
+		return nil, status.Error(codes.InvalidArgument, "Volume capability missing in request")
+	}
+	if len(req.GetVolumeId()) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "Volume ID missing in request")
+	}
+	if len(req.GetTargetPath()) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "Target path missing in request")
+	}
 	// volumeID = serialID = kubevirt's DataVolume.metadata.uid
 	// TODO link to kubevirt code
 	device, err := getDeviceBySerialID(req.VolumeContext[serialParameter], n.deviceLister)
@@ -144,6 +174,18 @@ func (n *NodeService) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 
 //NodeUnpublishVolume unmount the volume from the worker node
 func (n *NodeService) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
+	// Check arguments
+	if len(req.GetVolumeId()) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "Volume ID missing in request")
+	}
+	if len(req.GetTargetPath()) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "Target path missing in request")
+	}
+
+	if _, err := os.Stat(req.GetTargetPath()); os.IsNotExist(err) {
+		return nil, status.Error(codes.NotFound, "Volume is not mounted at specified location " + req.GetTargetPath())
+	}
+	
 	klog.Infof("Unmounting %s", req.GetTargetPath())
 	err := n.fsMounter.Unmount(req.GetTargetPath())
 	if err != nil {

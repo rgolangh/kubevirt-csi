@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-source hack/common.sh
+source hack/common-functional.sh
 ## source cluster/kubevirtci.sh
 
 

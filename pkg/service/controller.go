@@ -3,8 +3,12 @@ package service
 import (
 	"fmt"
 	"strings"
+	"time"
 
+	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/klog"
 	v1 "kubevirt.io/client-go/api/v1"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -25,6 +29,7 @@ const (
 	busDefaultValue                = "scsi"
 	serialParameter                = "serial"
 	hotplugDiskPrefix              = "disk-"
+	GiB                            = 1024 * 1024 * 1024
 )
 
 //ControllerService implements the controller interface
@@ -44,10 +49,22 @@ var controllerCaps = []csi.ControllerServiceCapability_RPC_Type{
 func (c *ControllerService) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
 	log.Infof("Creating volume %s", req.Name)
 
+	// Check arguments
+	if len(req.GetName()) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "Name missing in request")
+	}
+	caps := req.GetVolumeCapabilities()
+	if caps == nil {
+		return nil, status.Error(codes.InvalidArgument, "Volume Capabilities missing in request")
+	}
+
 	// Prepare parameters for the DataVolume
 	storageClassName := req.Parameters[infraStorageClassNameParameter]
 	volumeMode := getVolumeModeFromRequest(req)
 	storageSize := req.GetCapacityRange().GetRequiredBytes()
+	if storageSize == 0 {
+		storageSize = 20 * GiB
+	}
 	dvName := req.Name
 	bus, ok := req.Parameters[busParameter]
 	if !ok {
@@ -70,6 +87,38 @@ func (c *ControllerService) CreateVolume(ctx context.Context, req *csi.CreateVol
 		},
 	}
 	dv.Spec.Source.Blank = &cdiv1.DataVolumeBlankImage{}
+
+	remoteDV, _err := c.infraClient.GetDataVolume(c.infraClusterNamespace, dvName)
+	if _err == nil {
+		remotePVC := remoteDV.Spec.PVC
+		localPVC := dv.Spec.PVC
+
+		remoteStorageClassName := remotePVC.StorageClassName
+		localStorageClassName := localPVC.StorageClassName
+
+		remoteResourceRequests := remotePVC.Resources.Requests[corev1.ResourceStorage]
+		localResourceRequests := localPVC.Resources.Requests[corev1.ResourceStorage]
+
+		remoteVolumeMode := remotePVC.VolumeMode
+		localVolumeMode := localPVC.VolumeMode
+		if remoteResourceRequests.Equal(localResourceRequests) && *remoteVolumeMode == *localVolumeMode && *remoteStorageClassName == *localStorageClassName {
+			serial := string(remoteDV.GetUID())
+
+			// Return response
+			return &csi.CreateVolumeResponse{
+				Volume: &csi.Volume{
+					CapacityBytes: storageSize,
+					VolumeId:      dvName,
+					VolumeContext: map[string]string{
+						busParameter:    bus,
+						serialParameter: serial,
+					},
+				},
+			}, nil
+		} else {
+			return nil, status.Error(codes.AlreadyExists, "Volume with same name and different parameters already exists")
+		}
+	}
 
 	// Create DataVolume
 	dv, err := c.infraClient.CreateDataVolume(c.infraClusterNamespace, dv)
@@ -97,10 +146,23 @@ func (c *ControllerService) CreateVolume(ctx context.Context, req *csi.CreateVol
 
 // DeleteVolume removes the data volume from kubevirt
 func (c *ControllerService) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest) (*csi.DeleteVolumeResponse, error) {
+	if len(req.GetVolumeId()) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "Volume ID missing in request")
+	}
+
+	volumeID := req.GetVolumeId()
+	_, err := c.infraClient.GetDataVolume(c.infraClusterNamespace, volumeID)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return &csi.DeleteVolumeResponse{}, nil
+		}
+		return nil, status.Error(codes.NotFound, "Volume not found")
+	}
+
 	dvName := req.VolumeId
 	log.Infof("Removing data volume with %s", dvName)
 
-	err := c.infraClient.DeleteDataVolume(c.infraClusterNamespace, dvName)
+	err = c.infraClient.DeleteDataVolume(c.infraClusterNamespace, dvName)
 	if err != nil {
 		log.Error("Failed deleting DataVolume " + dvName)
 		return nil, err
@@ -112,16 +174,34 @@ func (c *ControllerService) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 // ControllerPublishVolume takes a volume, which is an kubevirt disk, and attaches it to a node, which is an kubevirt VM.
 func (c *ControllerService) ControllerPublishVolume(
 	ctx context.Context, req *csi.ControllerPublishVolumeRequest) (*csi.ControllerPublishVolumeResponse, error) {
+	volumeID := req.GetVolumeId()
+	if len(volumeID) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
+	}
+
+	nodeID := req.GetNodeId()
+	if len(nodeID) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "Node ID not provided")
+	}
+
+	volCap := req.GetVolumeCapability()
+	if volCap == nil {
+		return nil, status.Error(codes.InvalidArgument, "Volume capability not provided")
+	}
 
 	dvName := req.VolumeId
+
+	_, err := c.infraClient.GetDataVolume(c.infraClusterNamespace, volumeID)
+	if err != nil {
+		return nil, status.Error(codes.NotFound, "Volume not found")
+	}
 
 	log.Infof("Attaching DataVolume %s to Node ID %s", dvName, req.NodeId)
 
 	// Get VM name
 	vmName, err := c.getVMNameByCSINodeID(req.NodeId)
 	if err != nil {
-		log.Error("Failed getting VM Name for node ID " + req.NodeId)
-		return nil, err
+		return nil, status.Error(codes.NotFound, "Failed getting VM Name for node ID "+req.NodeId)
 	}
 
 	// Determine disk name (disk-<DataVolume-name>)
@@ -159,11 +239,54 @@ func (c *ControllerService) ControllerPublishVolume(
 		return nil, err
 	}
 
+	backoff := wait.Backoff{
+		Duration: 1 * time.Second,
+		Factor:   1.8,
+		Steps:    13,
+	}
+
+	verifyVolumeFunc := func() (bool, error) {
+		remoteVM, err := c.infraClient.GetVirtualMachine(c.infraClusterNamespace, vmName)
+		if err != nil {
+			log.Error("Failed getting vm " + vmName + " from infra kubevirt")
+			return false, err
+		}
+		volumeStatuses := remoteVM.Status.VolumeStatus
+		var relevantVolumeStatus *v1.VolumeStatus = nil
+		for _, volumeStatus := range volumeStatuses {
+			if volumeStatus.Name == diskName {
+				relevantVolumeStatus = &volumeStatus
+			}
+		}
+		if relevantVolumeStatus == nil {
+			msg := "volume " + dvName + " is not yet bound to vm " + vmName
+			log.Error(msg)
+			return false, nil
+		}
+		return true, nil
+	}
+
+	err = wait.ExponentialBackoff(backoff, verifyVolumeFunc)
+	if err != nil {
+		log.Error("Failed waiting for volume " + dvName + "to attach to VM " + vmName)
+		return nil, err
+	}
+
 	return &csi.ControllerPublishVolumeResponse{}, nil
 }
 
 // ControllerUnpublishVolume detaches the disk from the VM.
 func (c *ControllerService) ControllerUnpublishVolume(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest) (*csi.ControllerUnpublishVolumeResponse, error) {
+	volumeID := req.GetVolumeId()
+	if len(volumeID) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
+	}
+
+	nodeID := req.GetNodeId()
+	if len(nodeID) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "Node ID not provided")
+	}
+
 	dvName := req.VolumeId
 	log.Infof("Detaching DataVolume %s from Node ID %s", dvName, req.NodeId)
 
@@ -187,8 +310,31 @@ func (c *ControllerService) ControllerUnpublishVolume(ctx context.Context, req *
 }
 
 //ValidateVolumeCapabilities unimplemented
-func (c *ControllerService) ValidateVolumeCapabilities(context.Context, *csi.ValidateVolumeCapabilitiesRequest) (*csi.ValidateVolumeCapabilitiesResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "")
+func (c *ControllerService) ValidateVolumeCapabilities(ctx context.Context, req *csi.ValidateVolumeCapabilitiesRequest) (*csi.ValidateVolumeCapabilitiesResponse, error) {
+	klog.V(4).Infof("ValidateVolumeCapabilities: called with args %+v", *req)
+	volumeID := req.GetVolumeId()
+	if len(volumeID) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
+	}
+
+	volCaps := req.GetVolumeCapabilities()
+	if len(volCaps) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "Volume capabilities not provided")
+	}
+
+	if _, err := c.infraClient.GetDataVolume(c.infraClusterNamespace, volumeID); err != nil {
+		if errors.IsNotFound(err) {
+			return nil, status.Error(codes.NotFound, "Volume not found")
+		}
+		return nil, status.Errorf(codes.Internal, "Could not get volume with ID %q: %v", volumeID, err)
+	}
+
+	var confirmed *csi.ValidateVolumeCapabilitiesResponse_Confirmed
+	confirmed = &csi.ValidateVolumeCapabilitiesResponse_Confirmed{VolumeCapabilities: volCaps}
+
+	return &csi.ValidateVolumeCapabilitiesResponse{
+		Confirmed: confirmed,
+	}, nil
 }
 
 //ListVolumes unimplemented

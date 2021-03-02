@@ -1,4 +1,4 @@
-package functional_test
+package sanity_test
 
 import (
 	"testing"
@@ -10,5 +10,5 @@ import (
 
 func TestFunctional(t *testing.T) {
 	RegisterFailHandler(Fail)
-	RunSpecs(t, "Functional Suite")
+	RunSpecs(t, "Sanity Suite")
 }

@@ -11,8 +11,6 @@ import (
 	"github.com/kubevirt/csi-driver/pkg/generated"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
-	ocproutev1 "github.com/openshift/api/route/v1"
-	routesclientset "github.com/openshift/client-go/route/clientset/versioned/typed/route/v1"
 	v1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -20,18 +18,18 @@ import (
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/util/yaml"
 	apiwatch "k8s.io/apimachinery/pkg/watch"
-	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
-	"k8s.io/client-go/tools/clientcmd"
 	clientwatch "k8s.io/client-go/tools/watch"
 	kubevirtapiv1 "kubevirt.io/client-go/api/v1"
+
+	. "github.com/kubevirt/csi-driver/tests/common"
 )
 
 var infraCluster InfraCluster
 var tenantCluster TenantCluster
 
 var _ = BeforeSuite(func() {
-	infraCluster = getInfraCluster()
+	infraCluster = GetInfraCluster()
 	PrepareEnv(infraCluster)
 })
 
@@ -42,14 +40,14 @@ var _ = AfterSuite(func() {
 var _ = Describe("KubeVirt CSI Driver functional tests", func() {
 
 	BeforeEach(func() {
-		tenantCluster = getTenantCluster(infraCluster)
+		tenantCluster = GetTenantCluster(infraCluster)
 	})
 
 	Context("deployed on vanilla k8s", func() {
 
 		It("Deploys the CSI driver components", func() {
 			deployDriver(infraCluster, tenantCluster)
-			deploySecretWithInfraDetails(infraCluster, tenantCluster)
+			DeploySecretWithInfraDetails(infraCluster, tenantCluster)
 		})
 
 		It("Deploys a pod consuming a PV by PVC", func() {
@@ -80,58 +78,12 @@ var _ = Describe("KubeVirt CSI Driver functional tests", func() {
 	})
 })
 
-func getTenantCluster(c InfraCluster) TenantCluster {
-	waitForTenant(c)
-	// get the tenant kubeconfig
-	tenantConfigMap, err := c.virtCli.CoreV1().
-		ConfigMaps(c.namespace).Get(context.Background(), tenantConfigName, metav1.GetOptions{})
-	Expect(err).NotTo(HaveOccurred())
-
-	routes, err := routesclientset.NewForConfig(c.virtCli.Config())
-	Expect(err).NotTo(HaveOccurred())
-	route, err := routes.Routes(c.namespace).Get(context.Background(), routeName, metav1.GetOptions{})
-	Expect(err).NotTo(HaveOccurred())
-
-	tenantCluster, err := getTenantClusterSetup(tenantConfigMap, route)
-	Expect(err).NotTo(HaveOccurred())
-	return *tenantCluster
-}
-
-func waitForTenant(c InfraCluster) {
-	fmt.Fprintf(GinkgoWriter, "Wait for tenant to be up... ")
-	// wait till the config map is set by the tenant. This means the install is successful
-	// and we can extract the kubeconfig
-	tenantUpTimeout, cancelFunc := context.WithTimeout(context.Background(), time.Minute*40)
-	defer cancelFunc()
-	_, _ = clientwatch.UntilWithSync(
-		tenantUpTimeout,
-		cache.NewListWatchFromClient(c.virtCli.CoreV1().RESTClient(), "configmaps",
-			c.namespace, fields.OneTermEqualSelector("metadata.name", tenantConfigName)),
-		&v1.ConfigMap{},
-		nil,
-		func(event apiwatch.Event) (bool, error) {
-			switch event.Type {
-			case apiwatch.Added:
-			default:
-				return false, nil
-			}
-			_, ok := event.Object.(*v1.ConfigMap)
-			if !ok {
-				Fail("couldn't find config map 'tenant-config' in the namespace. Tenant cluster might failed installation")
-			}
-
-			fmt.Fprintf(GinkgoWriter, "up and running\n")
-			return true, nil
-		},
-	)
-}
-
 func deployDriver(c InfraCluster, tenantSetup TenantCluster) {
 	// 1. create ServiceAccount on infra
-	_, err := c.createObject(
-		*c.virtCli.Config(),
-		c.virtCli.Discovery(),
-		c.namespace,
+	_, err := c.CreateObject(
+		*c.VirtCli.Config(),
+		c.VirtCli.Discovery(),
+		c.Namespace,
 		bytes.NewReader(generated.MustAsset("deploy/infra-cluster-service-account.yaml")))
 	if !errors.IsAlreadyExists(err) {
 		Expect(err).NotTo(HaveOccurred())
@@ -144,10 +96,10 @@ func deployDriver(c InfraCluster, tenantSetup TenantCluster) {
 			continue
 		}
 		fmt.Fprintf(GinkgoWriter, "Deploying to tenant %s\n", a)
-		_, err := c.createObject(
-			*tenantSetup.restConfig,
-			tenantSetup.client.Discovery(),
-			tenantSetup.namespace,
+		_, err := c.CreateObject(
+			*tenantSetup.RestConfig,
+			tenantSetup.Client.Discovery(),
+			tenantSetup.Namespace,
 			bytes.NewReader(generated.MustAsset(a)),
 		)
 		if !errors.IsAlreadyExists(err) {
@@ -163,36 +115,8 @@ func destroyPVC(tenantSetup TenantCluster) error {
 	if err != nil {
 		return err
 	}
-	return tenantSetup.client.CoreV1().
-		PersistentVolumeClaims(tenantSetup.namespace).Delete(context.Background(), pvc.Name, metav1.DeleteOptions{})
-}
-
-func deploySecretWithInfraDetails(c InfraCluster, tenantSetup TenantCluster) {
-	s := v1.Secret{}
-	secretData := bytes.NewReader(generated.MustAsset("deploy/secret.yaml"))
-	err := yaml.NewYAMLToJSONDecoder(secretData).Decode(&s)
-	Expect(err).NotTo(HaveOccurred())
-
-	s.Data = make(map[string][]byte)
-	infraKubeconfig, err := c.kubeconfig.RawConfig()
-	Expect(err).NotTo(HaveOccurred())
-	kubeconfigData, err := clientcmd.Write(infraKubeconfig)
-	Expect(err).NotTo(HaveOccurred())
-	s.Data["kubeconfig"] = kubeconfigData
-	_, err = tenantSetup.client.CoreV1().Secrets(tenantSetup.namespace).Create(context.Background(), &s, metav1.CreateOptions{})
-	if !errors.IsAlreadyExists(err) {
-		Expect(err).NotTo(HaveOccurred())
-	}
-
-	cm := v1.ConfigMap{}
-	cmData := bytes.NewReader(generated.MustAsset("deploy/configmap.yaml"))
-	err = yaml.NewYAMLToJSONDecoder(cmData).Decode(&cm)
-	Expect(err).NotTo(HaveOccurred())
-	cm.Data["infraClusterNamespace"] = c.namespace
-	_, err = tenantSetup.client.CoreV1().ConfigMaps(tenantSetup.namespace).Create(context.Background(), &cm, metav1.CreateOptions{})
-	if !errors.IsAlreadyExists(err) {
-		Expect(err).NotTo(HaveOccurred())
-	}
+	return tenantSetup.Client.CoreV1().
+		PersistentVolumeClaims(tenantSetup.Namespace).Delete(context.Background(), pvc.Name, metav1.DeleteOptions{})
 }
 
 func deployStorageClass(tenantSetup TenantCluster) {
@@ -200,7 +124,7 @@ func deployStorageClass(tenantSetup TenantCluster) {
 	storageClassData := bytes.NewReader(generated.MustAsset("deploy/example/storageclass.yaml"))
 	err := yaml.NewYAMLToJSONDecoder(storageClassData).Decode(&sc)
 	Expect(err).NotTo(HaveOccurred())
-	_, err = tenantSetup.client.StorageV1().StorageClasses().Create(context.Background(), &sc, metav1.CreateOptions{})
+	_, err = tenantSetup.Client.StorageV1().StorageClasses().Create(context.Background(), &sc, metav1.CreateOptions{})
 	if !errors.IsAlreadyExists(err) {
 		Expect(err).NotTo(HaveOccurred())
 	}
@@ -211,7 +135,7 @@ func deployPVC(tenantSetup TenantCluster) {
 	pvcData := bytes.NewReader(generated.MustAsset("deploy/example/storage-claim.yaml"))
 	err := yaml.NewYAMLToJSONDecoder(pvcData).Decode(&pvc)
 	Expect(err).NotTo(HaveOccurred())
-	_, err = tenantSetup.client.CoreV1().PersistentVolumeClaims(tenantSetup.namespace).Create(context.Background(), &pvc, metav1.CreateOptions{})
+	_, err = tenantSetup.Client.CoreV1().PersistentVolumeClaims(tenantSetup.Namespace).Create(context.Background(), &pvc, metav1.CreateOptions{})
 	if !errors.IsAlreadyExists(err) {
 		Expect(err).NotTo(HaveOccurred())
 	}
@@ -222,7 +146,7 @@ func deployTestPod(tenantSetup TenantCluster) error {
 	podData := bytes.NewReader(generated.MustAsset("deploy/example/test-pod.yaml"))
 	err := yaml.NewYAMLToJSONDecoder(podData).Decode(&testPod)
 	Expect(err).NotTo(HaveOccurred())
-	_, err = tenantSetup.client.CoreV1().Pods(tenantSetup.namespace).Create(context.Background(), &testPod, metav1.CreateOptions{})
+	_, err = tenantSetup.Client.CoreV1().Pods(tenantSetup.Namespace).Create(context.Background(), &testPod, metav1.CreateOptions{})
 	if !errors.IsAlreadyExists(err) {
 		Expect(err).NotTo(HaveOccurred())
 	}
@@ -231,8 +155,8 @@ func deployTestPod(tenantSetup TenantCluster) error {
 	defer cancelFunc()
 	_, err = clientwatch.UntilWithSync(
 		testPodUpTimeout,
-		cache.NewListWatchFromClient(tenantSetup.client.CoreV1().RESTClient(), "pods",
-			tenantSetup.namespace, fields.OneTermEqualSelector("metadata.name", testPod.Name)),
+		cache.NewListWatchFromClient(tenantSetup.Client.CoreV1().RESTClient(), "pods",
+			tenantSetup.Namespace, fields.OneTermEqualSelector("metadata.name", testPod.Name)),
 		&v1.Pod{},
 		nil,
 		func(event apiwatch.Event) (bool, error) {
@@ -260,39 +184,7 @@ func destroyTestPod(tenantSetup TenantCluster) error {
 	podData := bytes.NewReader(generated.MustAsset("deploy/example/test-pod.yaml"))
 	err := yaml.NewYAMLToJSONDecoder(podData).Decode(&testPod)
 	Expect(err).NotTo(HaveOccurred())
-	return tenantSetup.client.CoreV1().Pods(tenantSetup.namespace).Delete(context.Background(), testPod.Name, metav1.DeleteOptions{})
-}
-
-func getTenantClusterSetup(cm *v1.ConfigMap, route *ocproutev1.Route) (*TenantCluster, error) {
-	// substitute the internal API IP with the ingress route
-	tenantConfigData := cm.Data["admin.conf"]
-	tenantConfig, err := clientcmd.Load([]byte(tenantConfigData))
-	if err != nil {
-		return nil, err
-	}
-	tenantConfig.Clusters["kubernetes"].Server = fmt.Sprintf("https://%s", route.Spec.Host)
-	if err != nil {
-		return nil, err
-	}
-	config, err := clientcmd.NewDefaultClientConfig(*tenantConfig, &clientcmd.ConfigOverrides{}).ClientConfig()
-	if err != nil {
-		return nil, err
-	}
-	tenantClient, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		return nil, err
-	}
-
-	version, err := tenantClient.ServerVersion()
-	fmt.Fprintf(GinkgoWriter, "Tenant server version %v\n", version)
-	Expect(err).NotTo(HaveOccurred())
-
-	return &TenantCluster{
-		namespace:  "kubevirt-csi-driver",
-		config:     tenantConfig,
-		restConfig: config,
-		client:     tenantClient,
-	}, nil
+	return tenantSetup.Client.CoreV1().Pods(tenantSetup.Namespace).Delete(context.Background(), testPod.Name, metav1.DeleteOptions{})
 }
 
 func watchDVUnpluged(c *InfraCluster) (*apiwatch.Event, error) {
@@ -301,8 +193,8 @@ func watchDVUnpluged(c *InfraCluster) (*apiwatch.Event, error) {
 
 	return clientwatch.UntilWithSync(
 		testDVUnplugTimeout,
-		cache.NewListWatchFromClient(c.virtCli.RestClient(), "virtualmachineinstances",
-			c.namespace, fields.OneTermEqualSelector("metadata.name", k8sMachineName)),
+		cache.NewListWatchFromClient(c.VirtCli.RestClient(), "virtualmachineinstances",
+			c.Namespace, fields.OneTermEqualSelector("metadata.name", K8sMachineName)),
 		&kubevirtapiv1.VirtualMachineInstance{},
 		nil,
 		func(event apiwatch.Event) (bool, error) {
@@ -310,7 +202,7 @@ func watchDVUnpluged(c *InfraCluster) (*apiwatch.Event, error) {
 			case apiwatch.Added, apiwatch.Modified:
 				vm, ok := event.Object.(*kubevirtapiv1.VirtualMachineInstance)
 				if !ok {
-					Fail("couldn't detect a change in VMI " + k8sMachineName)
+					Fail("couldn't detect a change in VMI " + K8sMachineName)
 				}
 				for _, vs := range vm.Status.VolumeStatus {
 					if vs.HotplugVolume != nil && vs.HotplugVolume.AttachPodName != "" {

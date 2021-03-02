@@ -1,0 +1,5 @@
+FROM quay.io/kubevirt/csi-driver:latest
+
+COPY ./bin/kubevirt-csi-driver /kubevirt-csi-driver
+
+ENTRYPOINT ["./kubevirt-csi-driver"]
